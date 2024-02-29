@@ -33,7 +33,7 @@ def response_generator():
         yield word + " "
         time.sleep(0.05)
 
-def chat_with_pdf(pdf,model):
+def chat_with_pdf(VectorStore, model):
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     if "openai_model" not in st.session_state:
         st.session_state["openai_model"] = model
@@ -46,19 +46,12 @@ def chat_with_pdf(pdf,model):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(f"{prompt}")
-
+        docs = VectorStore.similarity_search(query=prompt, k=3)
         with st.chat_message("assistant"):
-            stream = client.chat.completions.create(
-                model=st.session_state["openai_model"],
-                messages=[
-                    {"role": m["role"], "content": m["content"]}
-                    for m in st.session_state.messages
-                ],
-                stream=True,
-            )
-            response = st.write_stream(stream)
+            chain = load_qa_chain(llm=client, chain_type="stuff")
+            with get_openai_callback():
+                response = chain.run(input_documents=docs, question=prompt)
         st.session_state.messages.append({"role": "assistant", "content": response})
-
 
 def setup_sidebar():
     with st.sidebar:
@@ -98,12 +91,16 @@ def sidebar_explain_img(choice):
                     messages.chat_message("assistant").write(f"Echo: {prompt}")
 
 def upload_and_extract_text(pdf):
+    content = {}
     text = ""
     if pdf is not None:
         pdf_reader = PdfReader(pdf)
         for page in pdf_reader.pages:
-            text += page.extract_text()
-    return text, pdf.name if pdf else None
+            content[f"{page}"] = page
+            text_from_page = page.extract_text()
+            content[f"{page}-content"] = text_from_page
+            text += text_from_page
+    return text, content, pdf.name if pdf else None
 
 
 def split_text(text):
@@ -164,9 +161,13 @@ def main():
     st.header("Chat with PDF 💬")
     pdf = st.file_uploader("", type='pdf')
     if pdf:
-        chat_with_pdf(pdf,model)
-        file_name, extracted_text = body_handle_pdf(pdf)
-        body_handle_text(file_name, extracted_text)
+
+        file_name, extracted_text,content = body_handle_pdf(pdf)
+        if extracted_text:
+            chunks = split_text(extracted_text)
+            VectorStore = get_or_create_vector_store(file_name[:-4], chunks)
+            chat_with_pdf(VectorStore,pdf, model)
+        # body_handle_text(file_name, extracted_text)
         sidebar_show_extracted_text(choice,extracted_text)
         sidebar_explain_img(choice)
 
@@ -177,9 +178,8 @@ def body_handle_text(store_name, text):
         handle_query_and_generate_response(VectorStore)
 
 def body_handle_pdf(pdf):
-    if pdf:
-        text, file_name = upload_and_extract_text(pdf)
-        return file_name, text
+    text,content, file_name = upload_and_extract_text(pdf)
+    return file_name, text, content
 
 
 if __name__ == '__main__':
