@@ -1,27 +1,32 @@
+import asyncio
 import base64
-import os
-import pickle
 import time
-
-from dotenv import load_dotenv
 import streamlit as st
+from dotenv import load_dotenv
 from PyPDF2 import PdfReader
-from streamlit_extras.add_vertical_space import add_vertical_space
+from faiss import loader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.embeddings.openai import OpenAIEmbeddings
-from langchain.vectorstores import FAISS
+from langchain_community.vectorstores import FAISS
+from langchain_community.llms import OpenAI
 from langchain.chains.question_answering import load_qa_chain
-from langchain.callbacks import get_openai_callback
-from openai import OpenAI
+from langchain_community.callbacks import get_openai_callback
+import os
+import shutil
+import re
+from langchain_core.documents import Document
+from langchain.chains.combine_documents.stuff import StuffDocumentsChain
+from langchain.chains.llm import LLMChain
+from langchain.prompts import PromptTemplate
+from langchain.chains.summarize import load_summarize_chain
+from langchain_community.document_loaders import WebBaseLoader
+from langchain_openai import ChatOpenAI
+from langchain_text_splitters import CharacterTextSplitter
 
 PDF_PROP = "Chat"
 EXPLAIN_IMG = "Objasnienia zdjecia"
 LLM4 = 'gpt-4-turbo-preview'
 LLM3 = 'gpt-3.5-turbo-16k'
-
-
-
-
 def response_generator():
     response = r"""Hello there! How can I assist you today?
      a + ar + a r^2 + a r^3 + \cdots + a r^{n-1} =
@@ -33,8 +38,11 @@ def response_generator():
         yield word + " "
         time.sleep(0.05)
 
-def chat_with_pdf(VectorStore, model):
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+
+
+def body_chatbox(ext_text,file_name, model):
+    # client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     if "openai_model" not in st.session_state:
         st.session_state["openai_model"] = model
     if "messages" not in st.session_state:
@@ -46,20 +54,51 @@ def chat_with_pdf(VectorStore, model):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(f"{prompt}")
-        docs = VectorStore.similarity_search(query=prompt, k=3)
         with st.chat_message("assistant"):
-            chain = load_qa_chain(llm=client, chain_type="stuff")
-            with get_openai_callback():
-                response = chain.run(input_documents=docs, question=prompt)
-        st.session_state.messages.append({"role": "assistant", "content": response})
+            response = get_ai_response(ext_text, file_name, prompt, model)
+            st.session_state.messages.append({"role": "assistant", "content": response})
+            st.markdown(response)
+
+
+def get_ai_response(ext_text, file_name, prompt, model):
+    chunks = split_text(ext_text)
+    db = get_or_create_vector_store(file_name, chunks)
+    docs = db.similarity_search(prompt)
+    text_splitter = CharacterTextSplitter.from_tiktoken_encoder(
+        chunk_size=1000, chunk_overlap=0
+    )
+    split_docs = text_splitter.split_documents(docs)
+    prompt_template = f"""{prompt}:"""
+    llm = ChatOpenAI(temperature=0, model_name=model)
+    refine_prompt = PromptTemplate.from_template(prompt_template)
+
+    prompt_template = """Write a concise summary of the following:
+    {text}
+    CONCISE SUMMARY:"""
+    prompt2 = PromptTemplate.from_template(prompt_template)
+
+    chain = load_summarize_chain(
+        llm,
+        chain_type="refine",
+        question_prompt=prompt2,
+        verbose=True,
+        refine_prompt=refine_prompt,
+        return_intermediate_steps=True,
+        input_key="input_documents",
+        output_key="output_text",
+    )
+    result = chain({"input_documents":split_docs }, return_only_outputs=True)
+    response = result["output_text"]
+    return response
+
 
 def setup_sidebar():
     with st.sidebar:
         st.title('🤗💬 LLM Chat App')
         st.markdown('''## Ustawienia''')
-        llm = st.sidebar.selectbox('Wybierz LLM', [LLM4, LLM3])
+        llm = st.sidebar.selectbox('Wybierz LLM', [LLM3, LLM4])
         choice = st.radio("Co chcesz robic", [EXPLAIN_IMG, PDF_PROP], horizontal=True)
-    return choice,llm
+    return choice, llm
 
 
 # def sidebar_chat(choice):
@@ -90,17 +129,17 @@ def sidebar_explain_img(choice):
                     messages.chat_message("user").write(prompt)
                     messages.chat_message("assistant").write(f"Echo: {prompt}")
 
+
 def upload_and_extract_text(pdf):
     content = {}
     text = ""
-    if pdf is not None:
-        pdf_reader = PdfReader(pdf)
-        for page in pdf_reader.pages:
-            content[f"{page}"] = page
-            text_from_page = page.extract_text()
-            content[f"{page}-content"] = text_from_page
-            text += text_from_page
-    return text, content, pdf.name if pdf else None
+    pdf_reader = PdfReader(pdf)
+    for page in pdf_reader.pages:
+        content[f"{page}"] = page
+        text_from_page = page.extract_text()
+        content[f"{page}-content"] = text_from_page
+        text += text_from_page
+    return text, re.sub(r'[^A-Za-z0-9]+', '', pdf.name), content
 
 
 def split_text(text):
@@ -109,27 +148,32 @@ def split_text(text):
     return chunks
 
 
-def get_or_create_vector_store(store_name, chunks):
-    if os.path.exists(f"{store_name}.pkl"):
-        with open(f"{store_name}.pkl", "rb") as f:
-            VectorStore = pickle.load(f)
+def get_or_create_vector_store(file_name, chunks):
+    path = f"vector_stores/{file_name}"
+    embeddings = OpenAIEmbeddings()
+    if os.path.exists(path):
+        db = FAISS.load_local(path, embeddings)
     else:
-        embeddings = OpenAIEmbeddings()
-        VectorStore = FAISS.from_texts(chunks, embedding=embeddings)
-        with open(f"{store_name}.pkl", "wb") as f:
-            pickle.dump(VectorStore, f)
-    return VectorStore
+        db = FAISS.from_texts(chunks, embeddings)
+        db.save_local(path)
+    return db
 
 
-def handle_query_and_generate_response(VectorStore,query):
-    if query:
-        docs = VectorStore.similarity_search(query=query, k=3)
-        llm = OpenAI()
-        chain = load_qa_chain(llm=llm, chain_type="stuff")
-        with get_openai_callback() as cb:
-            response = chain.run(input_documents=docs, question=query)
-            print(cb)
-        return response
+def filter_vectore_store(embeddings):
+    list_of_documents = [
+        Document(page_content="foo", metadata=dict(page=1)),
+        Document(page_content="bar", metadata=dict(page=1)),
+        Document(page_content="foo", metadata=dict(page=2)),
+        Document(page_content="barbar", metadata=dict(page=2)),
+        Document(page_content="foo", metadata=dict(page=3)),
+        Document(page_content="bar burr", metadata=dict(page=3)),
+        Document(page_content="foo", metadata=dict(page=4)),
+        Document(page_content="bar bruh", metadata=dict(page=4)),
+    ]
+    db = FAISS.from_documents(list_of_documents, embeddings)
+    results_with_scores = db.similarity_search_with_score("foo")
+    for doc, score in results_with_scores:
+        print(f"Content: {doc.page_content}, Metadata: {doc.metadata}, Score: {score}")
 
 
 def display_pdf(f):
@@ -146,40 +190,42 @@ def display_pdf(f):
     st.markdown(pdf_display, unsafe_allow_html=True)
 
 
-def sidebar_show_extracted_text(choice,text):
+def sidebar_show_extracted_text(choice, text):
     if choice == PDF_PROP:
         with st.sidebar:
-            col1,col2 = st.columns(2)
+            col1, col2 = st.columns(2)
             with col1:
                 # st.write("assafdsfdf")
-                st.image("https://plus.unsplash.com/premium_photo-1675025863901-2c3fc0e28154?q=80&w=1935&auto=format&fit=crop&ixlib=rb-4.0.3&ixid=M3wxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8fA%3D%3D")
+                st.image(
+                    "https://plus.unsplash.com/premium_photo-1675025863901-2c3fc0e28154?q=80&w=1935&auto=format&fit=crop&ixlib=rb-4.0.3&ixid=M3wxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8fA%3D%3D")
             with col2:
-                st.text_area('Strona 1',disabled=True,value=text,height=300)
+                st.text_area('Strona 1', disabled=True, value=text, height=300)
+
+
+def clearLastSesion():
+    path = "vector_store"
+    for item in os.listdir(path):
+        item_path = os.path.join(path, item)
+        try:
+            if os.path.isfile(item_path) or os.path.islink(item_path):
+                os.remove(item_path)
+            elif os.path.isdir(item_path):
+                shutil.rmtree(item_path)
+        except Exception as e:
+            print(f"Failed to delete {item_path}. Reason: {e}")
+
+
 def main():
     load_dotenv()
-    choice,model = setup_sidebar()
+    # clearLastSesion()
+    choice, model = setup_sidebar()
     st.header("Chat with PDF 💬")
     pdf = st.file_uploader("", type='pdf')
     if pdf:
-
-        file_name, extracted_text,content = body_handle_pdf(pdf)
-        if extracted_text:
-            chunks = split_text(extracted_text)
-            VectorStore = get_or_create_vector_store(file_name[:-4], chunks)
-            chat_with_pdf(VectorStore,pdf, model)
-        # body_handle_text(file_name, extracted_text)
-        sidebar_show_extracted_text(choice,extracted_text)
+        extracted_text, file_name, content = upload_and_extract_text(pdf)
+        body_chatbox(extracted_text,file_name, model)
+        sidebar_show_extracted_text(choice, extracted_text)
         sidebar_explain_img(choice)
-
-def body_handle_text(store_name, text):
-    if text:
-        chunks = split_text(text)
-        VectorStore = get_or_create_vector_store(store_name[:-4], chunks)
-        handle_query_and_generate_response(VectorStore)
-
-def body_handle_pdf(pdf):
-    text,content, file_name = upload_and_extract_text(pdf)
-    return file_name, text, content
 
 
 if __name__ == '__main__':

@@ -136,3 +136,5 @@ cython_debug/
 
 # Environment variables
 .env.local
+
+vector_stores/
