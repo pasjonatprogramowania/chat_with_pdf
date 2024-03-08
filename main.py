@@ -272,13 +272,14 @@ def display_page_imgs(tab, key, val):
         return
     with tab:
         with st.expander(f"Strona {key}"):
-            col1, col2 = st.columns(2)
             for el in val['content_img']:
                 if el:
-                    with col1:
-                        st.image(el)
-                    with col2:
-                        st.text_area(f'Strona {key}', key=f'page_{key}_imgs_{el}', disabled=True, height=400)
+                    with st.container():
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.image(el)
+                        with col2:
+                            st.text_area(f'Strona {key}', key=f'page_{key}_imgs_{el}', disabled=True, height=400)
 
 
 def display_page_screenshot(tab, key, val):
